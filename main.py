@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from libxrk import aim_xrk
+from libxrk import aim_xrk, ChannelMetadata
 
 app = FastAPI(title="KartSync XRK Service")
 
@@ -102,6 +102,77 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/debug")
+async def debug_xrk(
+    file: UploadFile = File(...),
+    x_kartsync_secret: str = Header(default=""),
+):
+    """Diagnostic endpoint — no filtering, just reports what libxrk actually
+    found in the file so we can see why lap detection is behaving oddly."""
+    if SHARED_SECRET and x_kartsync_secret != SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid or missing shared secret")
+
+    contents = await file.read()
+    suffix = ".xrk" if file.filename.lower().endswith(".xrk") else ".xrz"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
+
+    try:
+        log = aim_xrk(tmp_path)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not parse XRK file: {e}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    metadata = getattr(log, "metadata", {}) or {}
+    channel_names = list(log.channels.keys())
+    spd_ch = find_channel(channel_names, SPEED_HINTS, exclude=["accuracy", "acc"])
+    rpm_ch = find_channel(channel_names, RPM_HINTS)
+
+    laps_table = log.laps
+    lap_nums = laps_table.column("num").to_pylist()
+    lap_starts = laps_table.column("start_time").to_pylist()
+    lap_ends = laps_table.column("end_time").to_pylist()
+
+    lap_summaries = []
+    for lap_num, start_ms, end_ms in list(zip(lap_nums, lap_starts, lap_ends))[:5]:
+        entry = {
+            "lap": lap_num,
+            "start_time_raw": start_ms,
+            "end_time_raw": end_ms,
+            "duration_as_ms_diff_div_1000": (end_ms - start_ms) / 1000.0 if start_ms is not None and end_ms is not None else None,
+        }
+        if spd_ch:
+            try:
+                lap_log = log.filter_by_lap(lap_num)
+                aligned = lap_log.resample_to_channel(spd_ch)
+                df = aligned.get_channels_as_table().to_pandas()
+                spd_vals = df.get(spd_ch, []).tolist()
+                entry["speed_channel_used"] = spd_ch
+                entry["speed_min_raw"] = min(spd_vals) if spd_vals else None
+                entry["speed_max_raw"] = max(spd_vals) if spd_vals else None
+                entry["speed_sample_first10"] = spd_vals[:10]
+                spd_meta = ChannelMetadata.from_channel_table(log.channels[spd_ch])
+                entry["speed_channel_units"] = spd_meta.units
+            except Exception as e:
+                entry["speed_error"] = str(e)
+        lap_summaries.append(entry)
+
+    return {
+        "filename": file.filename,
+        "metadata_raw": {str(k): str(v) for k, v in dict(metadata).items()},
+        "channel_names_all": channel_names,
+        "detected_speed_channel": spd_ch,
+        "detected_rpm_channel": rpm_ch,
+        "total_laps_in_file": len(lap_nums),
+        "first_5_laps_raw": lap_summaries,
+    }
+
+
 @app.post("/parse")
 async def parse_xrk(
     file: UploadFile = File(...),
@@ -158,7 +229,6 @@ async def parse_xrk(
 
     # Speed unit normalisation — KartSync stores/display speed in mph
     # throughout; convert if the channel's recorded units say km/h.
-    from libxrk import ChannelMetadata
     spd_meta = ChannelMetadata.from_channel_table(log.channels[spd_ch])
     spd_units = (spd_meta.units or "").lower()
     kmh_to_mph = 0.621371
