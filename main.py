@@ -113,6 +113,58 @@ def downsample(seq, target_points):
     return [seq[i] for i in range(0, len(seq), every)]
 
 
+def _channel_value_column(table):
+    """PyArrow channel tables have 'timecodes' plus one value column — return
+    the value column's name."""
+    for name in table.column_names:
+        if name.lower() != "timecodes":
+            return name
+    return None
+
+
+def _channel_peak(log, channel_name):
+    try:
+        table = log.channels[channel_name]
+        col = _channel_value_column(table)
+        if col is None:
+            return None
+        return max(table.column(col).to_pylist())
+    except Exception:
+        return None
+
+
+def resolve_egt_channel(log, channel_names):
+    """Find the EGT channel. Prefers an explicitly-named channel; falls back
+    to disambiguating generic "Temperature N" channels by peak value — EGT on
+    a 2-stroke kart runs 500-800C, coolant/water never approaches that, so
+    whichever generic temperature channel peaks far higher is EGT.
+
+    Returns (egt_channel_name_or_None, detection_note).
+    """
+    named = find_channel(channel_names, EGT_HINTS)
+    if named:
+        return named, "matched by name"
+
+    temp_channels = [c for c in channel_names if "temperature" in _norm(c) and "alarm" not in _norm(c)]
+    if len(temp_channels) < 2:
+        return None, "no named EGT channel and fewer than 2 generic temperature channels to disambiguate"
+
+    peaks = {c: _channel_peak(log, c) for c in temp_channels}
+    peaks = {c: v for c, v in peaks.items() if v is not None}
+    if len(peaks) < 2:
+        return None, "could not read values from generic temperature channels"
+
+    egt_ch = max(peaks, key=peaks.get)
+    water_ch = min(peaks, key=peaks.get)
+    # Sanity check: EGT should be well above a plausible max water temp (~120C
+    # even under extreme conditions). If the gap isn't there, don't guess.
+    if peaks[egt_ch] < 150:
+        return None, f"highest generic temperature channel ({egt_ch}) peaks at only {peaks[egt_ch]:.0f} — too low to confidently be EGT"
+
+    note = f"inferred from value range — {egt_ch} peaks {peaks[egt_ch]:.0f} (EGT), {water_ch} peaks {peaks[water_ch]:.0f} (water)"
+    return egt_ch, note
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -148,6 +200,12 @@ async def debug_xrk(
     channel_names = list(log.channels.keys())
     spd_ch = find_channel(channel_names, SPEED_HINTS, exclude=["accuracy", "acc"])
     rpm_ch = find_channel(channel_names, RPM_HINTS)
+    egt_ch, egt_detection_note = resolve_egt_channel(log, channel_names)
+    temp_channel_peaks = {
+        c: _channel_peak(log, c)
+        for c in channel_names
+        if "temperature" in _norm(c) and "alarm" not in _norm(c)
+    }
 
     laps_table = log.laps
     lap_nums = laps_table.column("num").to_pylist()
@@ -184,6 +242,9 @@ async def debug_xrk(
         "channel_names_all": channel_names,
         "detected_speed_channel": spd_ch,
         "detected_rpm_channel": rpm_ch,
+        "detected_egt_channel": egt_ch,
+        "egt_detection_note": egt_detection_note,
+        "temperature_channel_peaks": temp_channel_peaks,
         "total_laps_in_file": len(lap_nums),
         "first_5_laps_raw": lap_summaries,
     }
@@ -225,7 +286,7 @@ async def parse_xrk(
     channel_names = list(log.channels.keys())
     rpm_ch = find_channel(channel_names, RPM_HINTS)
     spd_ch = find_channel(channel_names, SPEED_HINTS, exclude=["accuracy", "acc"])
-    egt_ch = find_channel(channel_names, EGT_HINTS)
+    egt_ch, egt_detection_note = resolve_egt_channel(log, channel_names)
     lat_ch = find_channel(channel_names, LAT_HINTS)
     lon_ch = find_channel(channel_names, LON_HINTS)
     latg_ch = find_channel(channel_names, LATG_HINTS)
@@ -399,4 +460,6 @@ async def parse_xrk(
         "flyingLaps": flying_laps,
         "hasEGT": has_egt,
         "maxEGT": max_egt,
+        "egt_channel_used": egt_ch,
+        "egt_detection_note": egt_detection_note,
     }
