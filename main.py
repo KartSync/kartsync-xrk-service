@@ -227,16 +227,23 @@ async def parse_xrk(
             detail="No GPS speed channel found in this file — cannot detect laps.",
         )
 
-    # Speed unit normalisation — KartSync stores/display speed in mph
-    # throughout; convert if the channel's recorded units say km/h.
+    # Speed unit normalisation — KartSync stores/displays speed in mph
+    # throughout. Confirmed via real hardware: AiM's raw "GPS Speed" channel
+    # is reported in m/s (not km/h) — handle that plus km/h and mph so this
+    # is robust across different logger configs.
     spd_meta = ChannelMetadata.from_channel_table(log.channels[spd_ch])
-    spd_units = (spd_meta.units or "").lower()
-    kmh_to_mph = 0.621371
+    spd_units = (spd_meta.units or "").strip().lower()
+    MS_TO_MPH = 2.236936
+    KMH_TO_MPH = 0.621371
 
     def to_mph(v):
         if v is None:
             return 0.0
-        return v * kmh_to_mph if "km" in spd_units else v
+        if spd_units in ("m/s", "mps", "meters/sec", "metres/sec") or "m/s" in spd_units:
+            return v * MS_TO_MPH
+        if "km" in spd_units:
+            return v * KMH_TO_MPH
+        return v  # already mph, or units unknown — assume no conversion needed
 
     laps_table = log.laps
     lap_nums = laps_table.column("num").to_pylist()
