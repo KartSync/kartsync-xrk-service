@@ -38,23 +38,39 @@ SHARED_SECRET = os.environ.get("KARTSYNC_SHARED_SECRET", "")
 
 # ── Channel name matching ────────────────────────────────────────────────
 # XRK channel names depend on how the logger was configured, so match
-# fuzzily (case-insensitive substring) rather than expecting exact names —
-# mirrors the approach already used in parseAIM() for CSV headers.
-RPM_HINTS = ["engine rpm", "rpm"]
-SPEED_HINTS = ["gps speed", "speed"]
+# fuzzily rather than expecting exact names — mirrors the approach already
+# used in parseAIM() for CSV headers. Matching is done on a normalised form
+# (lowercased, spaces/underscores stripped) since real AiM channel names mix
+# both styles inconsistently (e.g. "GPS Speed" vs "GPS_LateralAcc").
+RPM_HINTS = ["enginerpm", "rpm"]
+SPEED_HINTS = ["gpsspeed", "speed"]
 EGT_HINTS = ["exhaust", "egt"]
-LAT_HINTS = ["gps latitude", "latitude"]
-LON_HINTS = ["gps longitude", "longitude"]
-LATG_HINTS = ["gps latacc", "lateral acc", "acc lat", "latacc"]
-LONG_HINTS = ["gps lonacc", "longitudinal acc", "acc lon", "lonacc"]
-GEAR_HINTS = ["calculated gear", "gear"]
+LAT_HINTS = ["gpslatitude", "latitude"]
+LON_HINTS = ["gpslongitude", "longitude"]
+# Confirmed against real hardware: AiM's GPS-derived G-force channels are
+# named "GPS_LateralAcc" (lateral) and "GPS_InlineAcc" (longitudinal) — not
+# "LonAcc" as originally assumed.
+LATG_HINTS = ["gpslateralacc", "lateralacc", "acclat", "latacc"]
+LONG_HINTS = ["gpsinlineacc", "inlineacc", "gpslonacc", "longitudinalacc", "acclon", "lonacc"]
+GEAR_HINTS = ["calculatedgear", "gear"]
+
+# Channels containing any of these are never a valid match for the hints
+# above, regardless of what else they contain — e.g. "EGT Alarm_1" contains
+# "egt" but is a 0/1 threshold flag, not a temperature reading.
+GLOBAL_EXCLUDE = ["alarm"]
+
+
+def _norm(s):
+    return s.lower().replace(" ", "").replace("_", "").replace("-", "")
 
 
 def find_channel(channel_names, hints, exclude=()):
-    lowered = {name: name.lower() for name in channel_names}
+    normed = {name: _norm(name) for name in channel_names}
+    all_exclude = list(exclude) + GLOBAL_EXCLUDE
     for hint in hints:
-        for name, lname in lowered.items():
-            if hint in lname and not any(ex in lname for ex in exclude):
+        hint_n = _norm(hint)
+        for name, nname in normed.items():
+            if hint_n in nname and not any(_norm(ex) in nname for ex in all_exclude):
                 return name
     return None
 
