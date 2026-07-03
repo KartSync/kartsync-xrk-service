@@ -1,0 +1,6 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+libxrk==0.12.0
+pandas>=2.0
+pyarrow>=15.0
