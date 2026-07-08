@@ -45,6 +45,7 @@ SHARED_SECRET = os.environ.get("KARTSYNC_SHARED_SECRET", "")
 RPM_HINTS = ["enginerpm", "rpm"]
 SPEED_HINTS = ["gpsspeed", "speed"]
 EGT_HINTS = ["exhaust", "egt"]
+WATER_HINTS = ["watertemp", "coolant", "water"]
 LAT_HINTS = ["gpslatitude", "latitude"]
 LON_HINTS = ["gpslongitude", "longitude"]
 # Confirmed against real hardware: AiM's GPS-derived G-force channels are
@@ -139,35 +140,38 @@ def _channel_peak(log, channel_name):
 
 
 def resolve_egt_channel(log, channel_names):
-    """Find the EGT channel. Prefers an explicitly-named channel; falls back
-    to disambiguating generic "Temperature N" channels by peak value — EGT on
+    """Find the EGT channel, and the water/coolant temperature channel where
+    identifiable. Prefers explicitly-named channels; falls back to
+    disambiguating generic "Temperature N" channels by peak value — EGT on
     a 2-stroke kart runs 500-800C, coolant/water never approaches that, so
-    whichever generic temperature channel peaks far higher is EGT.
+    whichever generic temperature channel peaks far higher is EGT and the
+    other is water.
 
-    Returns (egt_channel_name_or_None, detection_note).
+    Returns (egt_channel_name_or_None, water_channel_name_or_None, detection_note).
     """
-    named = find_channel(channel_names, EGT_HINTS)
-    if named:
-        return named, "matched by name"
+    named_egt = find_channel(channel_names, EGT_HINTS)
+    named_water = find_channel(channel_names, WATER_HINTS)
+    if named_egt:
+        return named_egt, named_water, "EGT matched by name" + (", water matched by name" if named_water else "")
 
     temp_channels = [c for c in channel_names if "temperature" in _norm(c) and "alarm" not in _norm(c)]
     if len(temp_channels) < 2:
-        return None, "no named EGT channel and fewer than 2 generic temperature channels to disambiguate"
+        return None, named_water, "no named EGT channel and fewer than 2 generic temperature channels to disambiguate"
 
     peaks = {c: _channel_peak(log, c) for c in temp_channels}
     peaks = {c: v for c, v in peaks.items() if v is not None}
     if len(peaks) < 2:
-        return None, "could not read values from generic temperature channels"
+        return None, named_water, "could not read values from generic temperature channels"
 
     egt_ch = max(peaks, key=peaks.get)
     water_ch = min(peaks, key=peaks.get)
     # Sanity check: EGT should be well above a plausible max water temp (~120C
     # even under extreme conditions). If the gap isn't there, don't guess.
     if peaks[egt_ch] < 150:
-        return None, f"highest generic temperature channel ({egt_ch}) peaks at only {peaks[egt_ch]:.0f} — too low to confidently be EGT"
+        return None, named_water, f"highest generic temperature channel ({egt_ch}) peaks at only {peaks[egt_ch]:.0f} — too low to confidently be EGT"
 
     note = f"inferred from value range — {egt_ch} peaks {peaks[egt_ch]:.0f} (EGT), {water_ch} peaks {peaks[water_ch]:.0f} (water)"
-    return egt_ch, note
+    return egt_ch, water_ch, note
 
 
 @app.get("/health")
@@ -211,7 +215,7 @@ async def parse_xrk(
     channel_names = list(log.channels.keys())
     rpm_ch = find_channel(channel_names, RPM_HINTS)
     spd_ch = find_channel(channel_names, SPEED_HINTS, exclude=["accuracy", "acc"])
-    egt_ch, egt_detection_note = resolve_egt_channel(log, channel_names)
+    egt_ch, water_ch, egt_detection_note = resolve_egt_channel(log, channel_names)
     lat_ch = find_channel(channel_names, LAT_HINTS)
     lon_ch = find_channel(channel_names, LON_HINTS)
     latg_ch = find_channel(channel_names, LATG_HINTS)
@@ -219,6 +223,7 @@ async def parse_xrk(
     gear_ch = find_channel(channel_names, GEAR_HINTS)
 
     has_egt = egt_ch is not None
+    has_water = water_ch is not None
     has_gps = lat_ch is not None and lon_ch is not None
     has_imu = latg_ch is not None and long_ch is not None
     has_gear = gear_ch is not None
@@ -282,6 +287,9 @@ async def parse_xrk(
         mean_egt_top = round(sum(top_egts) / len(top_egts), 1) if top_egts else None
         mean_egt_mid = round(sum(mid_egts) / len(mid_egts), 1) if mid_egts else None
 
+        waters = df.get(water_ch, []).tolist() if has_water else []
+        peak_water = round(max(waters), 1) if waters else None
+
         lats = df.get(lat_ch, []).tolist() if has_gps else []
         lons = df.get(lon_ch, []).tolist() if has_gps else []
         dist_arr = haversine_cum_dist(lats, lons) if has_gps else []
@@ -310,6 +318,8 @@ async def parse_xrk(
         }
         if has_egt:
             trace["egt"] = [round(egts[i], 1) if egts else 0 for i in idxs]
+        if has_water:
+            trace["water"] = [round(waters[i], 1) if waters else 0 for i in idxs]
         if has_gps:
             gps_idxs = list(range(0, n, trace_every))
             trace["lat"] = [round(lats[i], 7) for i in gps_idxs if abs(lats[i]) > 0.01]
@@ -326,6 +336,7 @@ async def parse_xrk(
             "peak_egt": peak_egt,
             "mean_egt_top": mean_egt_top,
             "mean_egt_mid": mean_egt_mid,
+            "peak_water": peak_water,
             "peak_lat_g": peak_lat_g,
             "peak_lon_g_accel": peak_lon_g_accel,
             "peak_lon_g_brake": peak_lon_g_brake,
@@ -340,6 +351,7 @@ async def parse_xrk(
         )
 
     max_egt = max((l["peak_egt"] for l in flying_laps if l["peak_egt"]), default=0)
+    max_water = max((l["peak_water"] for l in flying_laps if l["peak_water"]), default=0)
     peak_rpm_all = max((l["peak_rpm"] for l in flying_laps), default=0)
     peak_spd_all = max((l["peak_spd"] for l in flying_laps), default=0)
     best_lap = min(flying_laps, key=lambda l: l["lap_time"])
@@ -370,12 +382,14 @@ async def parse_xrk(
     telem_store = {
         "fname": file.filename,
         "hasEGT": has_egt,
+        "hasWater": has_water,
         "hasGPS": has_gps,
         "hasIMU": has_imu,
         "hasGear": has_gear,
         "flyingLaps": flying_laps,
         "bestLapTime": best_lap["lap_time"],
         "peakEGT": max_egt,
+        "peakWater": max_water,
         "peakRPM": peak_rpm_all,
         "peakSpd": peak_spd_all,
         "danger": danger_count,  # count of EGT samples >= 620C (KartSync's
@@ -393,7 +407,10 @@ async def parse_xrk(
         "telemStore": telem_store,
         "flyingLaps": flying_laps,
         "hasEGT": has_egt,
+        "hasWater": has_water,
         "maxEGT": max_egt,
+        "maxWater": max_water,
         "egt_channel_used": egt_ch,
+        "water_channel_used": water_ch,
         "egt_detection_note": egt_detection_note,
     }
