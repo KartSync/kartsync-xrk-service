@@ -154,7 +154,7 @@ def resolve_egt_channel(log, channel_names):
     if named_egt:
         return named_egt, named_water, "EGT matched by name" + (", water matched by name" if named_water else "")
 
-    temp_channels = [c for c in channel_names if "temperature" in _norm(c) and "alarm" not in _norm(c)]
+    temp_channels = [c for c in channel_names if "temperature" in _norm(c) and "alarm" not in _norm(c) and "logger" not in _norm(c)]
     if len(temp_channels) < 2:
         return None, named_water, "no named EGT channel and fewer than 2 generic temperature channels to disambiguate"
 
