@@ -412,5 +412,6 @@ async def parse_xrk(
         "maxWater": max_water,
         "egt_channel_used": egt_ch,
         "water_channel_used": water_ch,
-        "egt_detection_note": egt_detection_note,
+       "egt_detection_note": egt_detection_note,
+        "debug_all_channel_names": list(channel_names),
     }
