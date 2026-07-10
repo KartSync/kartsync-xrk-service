@@ -231,6 +231,12 @@ async def parse_xrk(
 
     try:
         log = aim_xrk(tmp_path)
+        print("XRK log object attributes:", [a for a in dir(log) if not a.startswith('_')])
+        for attr in ['date', 'datetime', 'session_date', 'start_time', 'timestamp', 'time']:
+            try:
+                print(f"log.{attr} =", getattr(log, attr))
+            except Exception as e:
+                print(f"log.{attr} — not available ({e})")
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Could not parse XRK file: {e}")
     finally:
