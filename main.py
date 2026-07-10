@@ -206,6 +206,231 @@ def resolve_egt_channel(log, channel_names):
     # matched by name above.
     return egt_ch, (named_water or water_ch), note
 
+def _parse_xrk_worker(tmp_path, filename, result_queue):
+    """
+    Runs the ENTIRE XRK parsing pipeline in an isolated subprocess. This is
+    deliberately the whole pipeline, not just the aim_xrk() constructor —
+    the resulting `log` object (a Cython/PyArrow-backed object with open
+    file handles) can't be pickled back across the process boundary, so
+    everything that touches `log` has to happen here, with only the final
+    JSON-safe response dict sent back to the parent process.
+
+    If libxrk segfaults anywhere in here — construction or later channel
+    access — only this subprocess dies. The parent process, and anyone
+    else's in-flight request, is unaffected.
+    """
+    try:
+        log = aim_xrk(tmp_path)
+        log_date_raw = log.metadata.get('Log Date')
+        log_time_raw = log.metadata.get('Log Time')
+        log_datetime_iso = None
+        if log_date_raw and log_time_raw:
+            try:
+                _dt = datetime.strptime(f"{log_date_raw} {log_time_raw}", "%m/%d/%Y %H:%M:%S")
+                log_datetime_iso = _dt.isoformat()
+            except Exception:
+                log_datetime_iso = None
+
+        metadata = getattr(log, "metadata", {}) or {}
+        logger_id = str(get_meta(metadata, "logger id", "loggerid", "logger serial")).strip()
+        logger_model = str(get_meta(metadata, "logger model", "loggermodel")).strip()
+        device_name = str(get_meta(metadata, "device name", "devicename")).strip()
+
+        channel_names = list(log.channels.keys())
+        rpm_ch = find_channel(channel_names, RPM_HINTS)
+        spd_ch = find_channel(channel_names, SPEED_HINTS, exclude=["accuracy", "acc"])
+        egt_ch, water_ch, egt_detection_note = resolve_egt_channel(log, channel_names)
+        lat_ch = find_channel(channel_names, LAT_HINTS)
+        lon_ch = find_channel(channel_names, LON_HINTS)
+        latg_ch = find_channel(channel_names, LATG_HINTS)
+        long_ch = find_channel(channel_names, LONG_HINTS)
+        gear_ch = find_channel(channel_names, GEAR_HINTS)
+
+        has_egt = egt_ch is not None
+        has_water = water_ch is not None
+        has_gps = lat_ch is not None and lon_ch is not None
+        has_imu = latg_ch is not None and long_ch is not None
+        has_gear = gear_ch is not None
+
+        if spd_ch is None:
+            result_queue.put(('error', "No GPS speed channel found in this file — cannot detect laps."))
+            return
+
+        spd_meta = ChannelMetadata.from_channel_table(log.channels[spd_ch])
+        spd_units = (spd_meta.units or "").strip().lower()
+        MS_TO_MPH = 2.236936
+        KMH_TO_MPH = 0.621371
+
+        def to_mph(v):
+            if v is None:
+                return 0.0
+            if spd_units in ("m/s", "mps", "meters/sec", "metres/sec") or "m/s" in spd_units:
+                return v * MS_TO_MPH
+            if "km" in spd_units:
+                return v * KMH_TO_MPH
+            return v
+
+        laps_table = log.laps
+        lap_nums = laps_table.column("num").to_pylist()
+        lap_starts = laps_table.column("start_time").to_pylist()
+        lap_ends = laps_table.column("end_time").to_pylist()
+
+        flying_laps = []
+        for lap_num, start_ms, end_ms in zip(lap_nums, lap_starts, lap_ends):
+            try:
+                lap_log = log.filter_by_lap(lap_num)
+                aligned = lap_log.resample_to_channel(spd_ch)
+                df = aligned.get_channels_as_table().to_pandas()
+            except Exception:
+                continue
+            if df.empty:
+                continue
+
+            lap_time = round((end_ms - start_ms) / 1000.0, 3)
+            if lap_time < 33 or lap_time > 120:
+                continue
+
+            spds_mph = [to_mph(v) for v in df.get(spd_ch, [])]
+            if not spds_mph or min(spds_mph) < 15:
+                continue
+
+            rpms = df.get(rpm_ch, []).tolist() if rpm_ch else []
+            peak_rpm = round(max(rpms)) if rpms else 0
+            peak_spd = round(max(spds_mph), 1)
+
+            egts = df.get(egt_ch, []).tolist() if has_egt else []
+            peak_egt = round(max(egts), 1) if egts else None
+            top_egts = [e for r, e in zip(rpms, egts) if r > 13000] if (rpms and egts) else []
+            mid_egts = [e for r, e in zip(rpms, egts) if 10000 < r < 12500] if (rpms and egts) else []
+            mean_egt_top = round(sum(top_egts) / len(top_egts), 1) if top_egts else None
+            mean_egt_mid = round(sum(mid_egts) / len(mid_egts), 1) if mid_egts else None
+
+            waters = df.get(water_ch, []).tolist() if has_water else []
+            peak_water = round(max(waters), 1) if waters else None
+
+            lats = df.get(lat_ch, []).tolist() if has_gps else []
+            lons = df.get(lon_ch, []).tolist() if has_gps else []
+            dist_arr = haversine_cum_dist(lats, lons) if has_gps else []
+
+            latgs = df.get(latg_ch, []).tolist() if has_imu else []
+            longs = df.get(long_ch, []).tolist() if has_imu else []
+            peak_lat_g = round(max(abs(v) for v in latgs), 3) if latgs else None
+            peak_lon_g_accel = round(max(longs), 3) if longs else None
+            peak_lon_g_brake = round(min(longs), 3) if longs else None
+
+            gears = df.get(gear_ch, []).tolist() if has_gear else []
+            peak_gear = round(max(gears)) if gears else 0
+
+            n = len(df)
+            every = max(1, n // 90)
+            trace_every = max(1, n // 400)
+            idxs = list(range(0, n, every))
+
+            time_col = [(t - start_ms) / 1000.0 for t in df.get("timecodes", range(n))]
+            trace = {
+                "time": [round(time_col[i], 1) for i in idxs],
+                "dist": [dist_arr[i] if i < len(dist_arr) else 0 for i in idxs],
+                "rpm": [round(rpms[i]) if rpms else 0 for i in idxs],
+                "spd": [round(spds_mph[i], 1) for i in idxs],
+                "gear": [round(gears[i]) if gears else 0 for i in idxs] if has_gear else [],
+            }
+            if has_egt:
+                trace["egt"] = [round(egts[i], 1) if egts else 0 for i in idxs]
+            if has_water:
+                trace["water"] = [round(waters[i], 1) if waters else 0 for i in idxs]
+            if has_gps:
+                gps_idxs = list(range(0, n, trace_every))
+                trace["lat"] = [round(lats[i], 7) for i in gps_idxs if abs(lats[i]) > 0.01]
+                trace["lon"] = [round(lons[i], 7) for i in gps_idxs if abs(lons[i]) > 0.01]
+            if has_imu:
+                trace["latG"] = [round(latgs[i], 3) if latgs else 0 for i in idxs]
+                trace["lonG"] = [round(longs[i], 3) if longs else 0 for i in idxs]
+
+            flying_laps.append({
+                "lap": int(lap_num),
+                "lap_time": lap_time,
+                "peak_rpm": peak_rpm,
+                "peak_spd": peak_spd,
+                "peak_egt": peak_egt,
+                "mean_egt_top": mean_egt_top,
+                "mean_egt_mid": mean_egt_mid,
+                "peak_water": peak_water,
+                "peak_lat_g": peak_lat_g,
+                "peak_lon_g_accel": peak_lon_g_accel,
+                "peak_lon_g_brake": peak_lon_g_brake,
+                "peak_gear": peak_gear,
+                "trace": trace,
+            })
+
+        if not flying_laps:
+            result_queue.put(('error', "No flying laps found (all laps outside 33-120s or below 15mph)."))
+            return
+
+        max_egt = max((l["peak_egt"] for l in flying_laps if l["peak_egt"]), default=0)
+        max_water = max((l["peak_water"] for l in flying_laps if l["peak_water"]), default=0)
+        peak_rpm_all = max((l["peak_rpm"] for l in flying_laps), default=0)
+        peak_spd_all = max((l["peak_spd"] for l in flying_laps), default=0)
+        best_lap = min(flying_laps, key=lambda l: l["lap_time"])
+
+        danger_count = sum(
+            1
+            for l in flying_laps
+            for e in l["trace"].get("egt", [])
+            if e >= DEFAULT_EGT_DANGER_THRESHOLD
+        ) if has_egt else 0
+
+        log_dt_raw = get_meta(metadata, "log date/time", "log date", "date/time", default="")
+        csv_date, csv_time = "", ""
+        if log_dt_raw:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(str(log_dt_raw), fmt)
+                    csv_date = dt.strftime("%Y-%m-%d")
+                    csv_time = dt.strftime("%H:%M")
+                    break
+                except ValueError:
+                    continue
+
+        duration_sec = round((max(lap_ends) - min(lap_starts)) / 1000.0, 1) if lap_starts else 0
+
+        telem_store = {
+            "fname": filename,
+            "hasEGT": has_egt,
+            "hasWater": has_water,
+            "hasGPS": has_gps,
+            "hasIMU": has_imu,
+            "hasGear": has_gear,
+            "flyingLaps": flying_laps,
+            "bestLapTime": best_lap["lap_time"],
+            "peakEGT": max_egt,
+            "peakWater": max_water,
+            "peakRPM": peak_rpm_all,
+            "peakSpd": peak_spd_all,
+            "danger": danger_count,
+            "csvDate": csv_date,
+            "csvTime": csv_time,
+            "durationSec": duration_sec,
+        }
+
+        response = {
+            "logger_id": logger_id,
+            "logger_model": logger_model,
+            "device_name": device_name,
+            "telemStore": telem_store,
+            "flyingLaps": flying_laps,
+            "hasEGT": has_egt,
+            "hasWater": has_water,
+            "maxEGT": max_egt,
+            "maxWater": max_water,
+            "egt_channel_used": egt_ch,
+            "water_channel_used": water_ch,
+            "egt_detection_note": egt_detection_note,
+            "log_datetime": log_datetime_iso,
+        }
+        result_queue.put(('ok', response))
+    except Exception as e:
+        result_queue.put(('error', f"Could not parse XRK file: {e}"))
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -224,235 +449,39 @@ async def parse_xrk(
 
     suffix = ".xrk" if file.filename.lower().endswith(".xrk") else ".xrz"
     contents = await file.read()
+    filename = file.filename
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(contents)
         tmp_path = tmp.name
 
     try:
-        log = aim_xrk(tmp_path)
-        log_date_raw = log.metadata.get('Log Date')   # e.g. '07/05/2026'
-        log_time_raw = log.metadata.get('Log Time')   # e.g. '16:15:37'
-        log_datetime_iso = None
-        if log_date_raw and log_time_raw:
-            try:
-                _dt = datetime.strptime(f"{log_date_raw} {log_time_raw}", "%m/%d/%Y %H:%M:%S")
-                log_datetime_iso = _dt.isoformat()
-            except Exception:
-                log_datetime_iso = None
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not parse XRK file: {e}")
+        result_queue = mp.Queue()
+        proc = mp.Process(target=_parse_xrk_worker, args=(tmp_path, filename, result_queue))
+        proc.start()
+        proc.join(timeout=60)
+
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+            raise HTTPException(
+                status_code=422,
+                detail="XRK parsing timed out — file may be corrupted or unusually large",
+            )
+
+        if proc.exitcode != 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"XRK parsing crashed (exit code {proc.exitcode}) — this file likely contains channel data the parser can't handle safely",
+            )
+
+        status, payload = result_queue.get()
+        if status == "error":
+            raise HTTPException(status_code=422, detail=payload)
+
+        return payload
     finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
-
-    metadata = getattr(log, "metadata", {}) or {}
-    logger_id = str(get_meta(metadata, "logger id", "loggerid", "logger serial")).strip()
-    logger_model = str(get_meta(metadata, "logger model", "loggermodel")).strip()
-    device_name = str(get_meta(metadata, "device name", "devicename")).strip()
-
-    channel_names = list(log.channels.keys())
-    rpm_ch = find_channel(channel_names, RPM_HINTS)
-    spd_ch = find_channel(channel_names, SPEED_HINTS, exclude=["accuracy", "acc"])
-    egt_ch, water_ch, egt_detection_note = resolve_egt_channel(log, channel_names)
-    lat_ch = find_channel(channel_names, LAT_HINTS)
-    lon_ch = find_channel(channel_names, LON_HINTS)
-    latg_ch = find_channel(channel_names, LATG_HINTS)
-    long_ch = find_channel(channel_names, LONG_HINTS)
-    gear_ch = find_channel(channel_names, GEAR_HINTS)
-
-    has_egt = egt_ch is not None
-    has_water = water_ch is not None
-    has_gps = lat_ch is not None and lon_ch is not None
-    has_imu = latg_ch is not None and long_ch is not None
-    has_gear = gear_ch is not None
-
-    if spd_ch is None:
-        raise HTTPException(
-            status_code=422,
-            detail="No GPS speed channel found in this file — cannot detect laps.",
-        )
-
-    # Speed unit normalisation — KartSync stores/displays speed in mph
-    # throughout. Confirmed via real hardware: AiM's raw "GPS Speed" channel
-    # is reported in m/s (not km/h) — handle that plus km/h and mph so this
-    # is robust across different logger configs.
-    spd_meta = ChannelMetadata.from_channel_table(log.channels[spd_ch])
-    spd_units = (spd_meta.units or "").strip().lower()
-    MS_TO_MPH = 2.236936
-    KMH_TO_MPH = 0.621371
-
-    def to_mph(v):
-        if v is None:
-            return 0.0
-        if spd_units in ("m/s", "mps", "meters/sec", "metres/sec") or "m/s" in spd_units:
-            return v * MS_TO_MPH
-        if "km" in spd_units:
-            return v * KMH_TO_MPH
-        return v  # already mph, or units unknown — assume no conversion needed
-
-    laps_table = log.laps
-    lap_nums = laps_table.column("num").to_pylist()
-    lap_starts = laps_table.column("start_time").to_pylist()
-    lap_ends = laps_table.column("end_time").to_pylist()
-
-    flying_laps = []
-    for lap_num, start_ms, end_ms in zip(lap_nums, lap_starts, lap_ends):
-        try:
-            lap_log = log.filter_by_lap(lap_num)
-            aligned = lap_log.resample_to_channel(spd_ch)
-            df = aligned.get_channels_as_table().to_pandas()
-        except Exception:
-            continue
-        if df.empty:
-            continue
-
-        lap_time = round((end_ms - start_ms) / 1000.0, 3)
-        if lap_time < 33 or lap_time > 120:
-            continue  # outside plausible KZ2 lap range — mirrors parseAIM
-
-        spds_mph = [to_mph(v) for v in df.get(spd_ch, [])]
-        if not spds_mph or min(spds_mph) < 15:
-            continue  # in/out/formation lap — never drops below 15mph on a flyer
-
-        rpms = df.get(rpm_ch, []).tolist() if rpm_ch else []
-        peak_rpm = round(max(rpms)) if rpms else 0
-        peak_spd = round(max(spds_mph), 1)
-
-        egts = df.get(egt_ch, []).tolist() if has_egt else []
-        peak_egt = round(max(egts), 1) if egts else None
-        top_egts = [e for r, e in zip(rpms, egts) if r > 13000] if (rpms and egts) else []
-        mid_egts = [e for r, e in zip(rpms, egts) if 10000 < r < 12500] if (rpms and egts) else []
-        mean_egt_top = round(sum(top_egts) / len(top_egts), 1) if top_egts else None
-        mean_egt_mid = round(sum(mid_egts) / len(mid_egts), 1) if mid_egts else None
-
-        waters = df.get(water_ch, []).tolist() if has_water else []
-        peak_water = round(max(waters), 1) if waters else None
-
-        lats = df.get(lat_ch, []).tolist() if has_gps else []
-        lons = df.get(lon_ch, []).tolist() if has_gps else []
-        dist_arr = haversine_cum_dist(lats, lons) if has_gps else []
-
-        latgs = df.get(latg_ch, []).tolist() if has_imu else []
-        longs = df.get(long_ch, []).tolist() if has_imu else []
-        peak_lat_g = round(max(abs(v) for v in latgs), 3) if latgs else None
-        peak_lon_g_accel = round(max(longs), 3) if longs else None
-        peak_lon_g_brake = round(min(longs), 3) if longs else None
-
-        gears = df.get(gear_ch, []).tolist() if has_gear else []
-        peak_gear = round(max(gears)) if gears else 0
-
-        n = len(df)
-        every = max(1, n // 90)
-        trace_every = max(1, n // 400)
-        idxs = list(range(0, n, every))
-
-        time_col = [(t - start_ms) / 1000.0 for t in df.get("timecodes", range(n))]
-        trace = {
-            "time": [round(time_col[i], 1) for i in idxs],
-            "dist": [dist_arr[i] if i < len(dist_arr) else 0 for i in idxs],
-            "rpm": [round(rpms[i]) if rpms else 0 for i in idxs],
-            "spd": [round(spds_mph[i], 1) for i in idxs],
-            "gear": [round(gears[i]) if gears else 0 for i in idxs] if has_gear else [],
-        }
-        if has_egt:
-            trace["egt"] = [round(egts[i], 1) if egts else 0 for i in idxs]
-        if has_water:
-            trace["water"] = [round(waters[i], 1) if waters else 0 for i in idxs]
-        if has_gps:
-            gps_idxs = list(range(0, n, trace_every))
-            trace["lat"] = [round(lats[i], 7) for i in gps_idxs if abs(lats[i]) > 0.01]
-            trace["lon"] = [round(lons[i], 7) for i in gps_idxs if abs(lons[i]) > 0.01]
-        if has_imu:
-            trace["latG"] = [round(latgs[i], 3) if latgs else 0 for i in idxs]
-            trace["lonG"] = [round(longs[i], 3) if longs else 0 for i in idxs]
-
-        flying_laps.append({
-            "lap": int(lap_num),
-            "lap_time": lap_time,
-            "peak_rpm": peak_rpm,
-            "peak_spd": peak_spd,
-            "peak_egt": peak_egt,
-            "mean_egt_top": mean_egt_top,
-            "mean_egt_mid": mean_egt_mid,
-            "peak_water": peak_water,
-            "peak_lat_g": peak_lat_g,
-            "peak_lon_g_accel": peak_lon_g_accel,
-            "peak_lon_g_brake": peak_lon_g_brake,
-            "peak_gear": peak_gear,
-            "trace": trace,
-        })
-
-    if not flying_laps:
-        raise HTTPException(
-            status_code=422,
-            detail="No flying laps found (all laps outside 33-120s or below 15mph).",
-        )
-
-    max_egt = max((l["peak_egt"] for l in flying_laps if l["peak_egt"]), default=0)
-    max_water = max((l["peak_water"] for l in flying_laps if l["peak_water"]), default=0)
-    peak_rpm_all = max((l["peak_rpm"] for l in flying_laps), default=0)
-    peak_spd_all = max((l["peak_spd"] for l in flying_laps), default=0)
-    best_lap = min(flying_laps, key=lambda l: l["lap_time"])
-
-    danger_count = sum(
-        1
-        for l in flying_laps
-        for e in l["trace"].get("egt", [])
-        if e >= DEFAULT_EGT_DANGER_THRESHOLD
-    ) if has_egt else 0
-
-
-    # Log date/time from metadata, formatted to match parseAIM's csvDate/csvTime
-    log_dt_raw = get_meta(metadata, "log date/time", "log date", "date/time", default="")
-    csv_date, csv_time = "", ""
-    if log_dt_raw:
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
-            try:
-                dt = datetime.strptime(str(log_dt_raw), fmt)
-                csv_date = dt.strftime("%Y-%m-%d")
-                csv_time = dt.strftime("%H:%M")
-                break
-            except ValueError:
-                continue
-
-    duration_sec = round((max(lap_ends) - min(lap_starts)) / 1000.0, 1) if lap_starts else 0
-
-    telem_store = {
-        "fname": file.filename,
-        "hasEGT": has_egt,
-        "hasWater": has_water,
-        "hasGPS": has_gps,
-        "hasIMU": has_imu,
-        "hasGear": has_gear,
-        "flyingLaps": flying_laps,
-        "bestLapTime": best_lap["lap_time"],
-        "peakEGT": max_egt,
-        "peakWater": max_water,
-        "peakRPM": peak_rpm_all,
-        "peakSpd": peak_spd_all,
-        "danger": danger_count,  # count of EGT samples >= 620C (KartSync's
-                                  # default alarm threshold), across all
-                                  # flying laps' downsampled traces
-        "csvDate": csv_date,
-        "csvTime": csv_time,
-        "durationSec": duration_sec,
-    }
-
-    return {
-        "logger_id": logger_id,
-        "logger_model": logger_model,
-        "device_name": device_name,
-        "telemStore": telem_store,
-        "flyingLaps": flying_laps,
-        "hasEGT": has_egt,
-        "hasWater": has_water,
-        "maxEGT": max_egt,
-        "maxWater": max_water,
-        "egt_channel_used": egt_ch,
-        "water_channel_used": water_ch,
-       "egt_detection_note": egt_detection_note,
-        "log_datetime": log_datetime_iso,
-    }
