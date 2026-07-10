@@ -231,9 +231,15 @@ async def parse_xrk(
 
     try:
         log = aim_xrk(tmp_path)
-        print("XRK log object attributes:", [a for a in dir(log) if not a.startswith('_')])
-        print("log.metadata =", log.metadata)
-        print("log.metadata type =", type(log.metadata))
+        log_date_raw = log.metadata.get('Log Date')   # e.g. '07/05/2026'
+        log_time_raw = log.metadata.get('Log Time')   # e.g. '16:15:37'
+        log_datetime_iso = None
+        if log_date_raw and log_time_raw:
+            try:
+                _dt = datetime.strptime(f"{log_date_raw} {log_time_raw}", "%m/%d/%Y %H:%M:%S")
+                log_datetime_iso = _dt.isoformat()
+            except Exception:
+                log_datetime_iso = None
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Could not parse XRK file: {e}")
     finally:
@@ -448,5 +454,5 @@ async def parse_xrk(
         "egt_channel_used": egt_ch,
         "water_channel_used": water_ch,
        "egt_detection_note": egt_detection_note,
-        "debug_all_channel_names": list(channel_names),
+        "log_datetime": log_datetime_iso,
     }
