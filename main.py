@@ -18,6 +18,7 @@ import os
 import math
 import tempfile
 import multiprocessing as mp
+import queue
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException
@@ -460,23 +461,29 @@ async def parse_xrk(
         result_queue = mp.Queue()
         proc = mp.Process(target=_parse_xrk_worker, args=(tmp_path, filename, result_queue))
         proc.start()
-        proc.join(timeout=60)
 
-        if proc.is_alive():
-            proc.terminate()
-            proc.join()
-            raise HTTPException(
-                status_code=422,
-                detail="XRK parsing timed out — file may be corrupted or unusually large",
-            )
+        result = None
+        try:
+            result = result_queue.get(timeout=60)
+        except queue.Empty:
+            pass
 
-        if proc.exitcode != 0:
+        proc.join(timeout=5)
+
+        if result is None:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
+                raise HTTPException(
+                    status_code=422,
+                    detail="XRK parsing timed out — file may be corrupted or unusually large",
+                )
             raise HTTPException(
                 status_code=422,
                 detail=f"XRK parsing crashed (exit code {proc.exitcode}) — this file likely contains channel data the parser can't handle safely",
             )
 
-        status, payload = result_queue.get()
+        status, payload = result
         if status == "error":
             raise HTTPException(status_code=422, detail=payload)
 
