@@ -478,6 +478,23 @@ async def parse_xrk(
                     status_code=422,
                     detail="XRK parsing timed out — file may be corrupted or unusually large",
                 )
+            if proc.exitcode == -11:
+                # SIGSEGV specifically — this is the known libxrk crash
+                # (tracked upstream: github.com/m3rlin45/libxrk/issues/1),
+                # not a problem with this account, device, or KartSync
+                # itself. Logged with a distinct, greppable prefix so we
+                # can search Railway's logs to see how often/who this
+                # actually affects, without needing a database for it.
+                print(f"KNOWN_LIBXRK_SEGFAULT filename={filename!r} exitcode={proc.exitcode}")
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "This file's internal format triggered a known issue in a "
+                        "third-party library used for XRK parsing — this isn't a "
+                        "problem with your account or device. We're tracking it "
+                        "upstream (github.com/m3rlin45/libxrk/issues/1)."
+                    ),
+                )
             raise HTTPException(
                 status_code=422,
                 detail=f"XRK parsing crashed (exit code {proc.exitcode}) — this file likely contains channel data the parser can't handle safely",
