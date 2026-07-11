@@ -121,6 +121,35 @@ def downsample(seq, target_points):
     return [seq[i] for i in range(0, len(seq), every)]
 
 
+def _sanitize_for_json(obj):
+    """Recursively replace inf/-inf/nan floats with None.
+
+    Standard JSON has no representation for these — Python's json encoder
+    raises ValueError if one slips through, which (since it happens during
+    response serialization, after our own try/except has already
+    succeeded) produces a malformed response the frontend can't parse,
+    showing up as a generic connection failure rather than a clear error.
+    A single corrupted channel value (e.g. from an unrecognised
+    calibration type) shouldn't take down an otherwise-valid session's
+    worth of data — this nulls out just the bad value(s) instead.
+    """
+    if isinstance(obj, float):
+        if obj != obj or obj in (float("inf"), float("-inf")):  # obj != obj catches NaN
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
+def _channel_value_column(table):
+    """PyArrow channel tables have 'timecodes' plus one value column — return
+    the value column's name."""
+    ...
+
+
 def _channel_value_column(table):
     """PyArrow channel tables have 'timecodes' plus one value column — return
     the value column's name."""
@@ -429,7 +458,7 @@ def _parse_xrk_worker(tmp_path, filename, result_queue):
             "egt_detection_note": egt_detection_note,
             "log_datetime": log_datetime_iso,
         }
-        result_queue.put(('ok', response))
+        result_queue.put(('ok', _sanitize_for_json(response)))
     except Exception as e:
         result_queue.put(('error', f"Could not parse XRK file: {e}"))
 
