@@ -357,9 +357,17 @@ def _parse_xrk_worker(tmp_path, filename, result_queue):
             trace_every = max(1, n // 400)
             idxs = list(range(0, n, every))
 
-            time_col = [(t - start_ms) / 1000.0 for t in df.get("timecodes", range(n))]
+            # Zero this lap's time against its OWN first resampled sample, not
+            # against start_ms (the lap-boundary timestamp from libxrk's lap
+            # table). resample_to_channel() aligns onto the speed channel's own
+            # sample grid, which doesn't necessarily land exactly on start_ms —
+            # the mismatch varies lap-to-lap and, after rounding, was showing up
+            # as an exact +0.1s offset on some laps' delta-vs-reference charts.
+            raw_timecodes = list(df.get("timecodes", range(n)))
+            t0 = raw_timecodes[0] if raw_timecodes else start_ms
+            time_col = [(t - t0) / 1000.0 for t in raw_timecodes]
             trace = {
-                "time": [round(time_col[i], 1) for i in idxs],
+                "time": [round(time_col[i], 2) for i in idxs],
                 "dist": [dist_arr[i] if i < len(dist_arr) else 0 for i in idxs],
                 "rpm": [round(rpms[i]) if rpms else 0 for i in idxs],
                 "spd": [round(spds_mph[i], 1) for i in idxs],
