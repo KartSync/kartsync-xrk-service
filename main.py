@@ -318,7 +318,7 @@ def _parse_xrk_worker(tmp_path, filename, result_queue):
                 continue
 
             lap_time = round((end_ms - start_ms) / 1000.0, 3)
-            if lap_time < 33 or lap_time > 120:
+            if lap_time < 15 or lap_time > 120:
                 continue
 
             spds_mph = [to_mph(v) for v in df.get(spd_ch, [])]
